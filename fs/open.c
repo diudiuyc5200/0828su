@@ -456,6 +456,18 @@ out:
 	return res;
 }
 
+SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+{
+#if defined(CONFIG_KSU) && \
+    !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE) && \
+    !defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK) && \
+    !defined(CONFIG_KSU_TRACEPOINT_HOOK)
+	extern int ksu_handle_faccessat(int *, const char __user **, int *, int *);
+	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+#endif
+	return do_faccessat(dfd, filename, mode);
+}
+
 SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
 {
 	return sys_faccessat(AT_FDCWD, filename, mode);
