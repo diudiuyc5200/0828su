@@ -1892,6 +1892,11 @@ out_unmark:
 	current->fs->in_exec = 0;
 	current->in_execve = 0;
 
+#ifdef CONFIG_KSU_SUSFS
+	if (unlikely(is_su_session))
+		(void)ksu_handle_post_execveat_sucompat(&fd, &filename, &argv, &envp, &flags, &retval);
+#endif // CONFIG_KSU_SUSFS
+
 out_free:
 	free_bprm(bprm);
 	kfree(pathbuf);
