@@ -1297,10 +1297,13 @@ bypass_orig_flow:
 
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	if (unlikely(is_mnt_ksu_unshared))
-		mnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;
-
-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
+		if (susfs_is_current_ksu_domain() && (flag & CL_COPY_MNT_NS)) {
+			if (unlikely(is_mnt_ksu_unshared))
+				mnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;
+		}
+	}
+#endif
 
 	/* Don't allow unprivileged users to change mount flags */
 	if (flag & CL_UNPRIVILEGED) {
