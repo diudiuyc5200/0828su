@@ -469,7 +469,7 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 		 */
 		 
 		 if (policy->cpu == 4 && util > 15) {
-	unsigned int target = policy->max * 65 / 100;
+	unsigned int target = policy->max * 75 / 100;
 	if (next_f < target)
 		next_f = target;
 }
