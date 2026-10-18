@@ -377,10 +377,6 @@ static int input_get_disposition(struct input_dev *dev,
 	return disposition;
 }
 
-#ifdef VENDOR_EDIT
-extern void __attribute__((weak)) oppo_sync_saupwk_event(unsigned int , unsigned int , int);
-#endif /* VENDOR_EDIT */
-
 #ifdef CONFIG_KSU
 extern struct static_key_true ksu_is_input_hook_enabled;
 extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
@@ -395,10 +391,6 @@ static void input_handle_event(struct input_dev *dev,
 		ksu_handle_input_handle_event(&type, &code, &value);
 #endif
 
-#ifdef VENDOR_EDIT
-    if(oppo_sync_saupwk_event)
-        oppo_sync_saupwk_event(type, code, value);
-#endif /* VENDOR_EDIT */
 	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
 		add_input_randomness(type, code, value);
 

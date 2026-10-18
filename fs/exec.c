@@ -1727,6 +1727,8 @@ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *ar
 			void *envp, int *flags);
 extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
 				void *envp, int *flags);
+extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+			void *envp, int *flags, int *retval);
 #endif
 static int __do_execve_file(int fd, struct filename *filename,
 			    struct user_arg_ptr argv,
@@ -1891,6 +1893,10 @@ out:
 out_unmark:
 	current->fs->in_exec = 0;
 	current->in_execve = 0;
+
+#ifdef CONFIG_KSU_SUSFS
+		(void)ksu_handle_post_execveat_sucompat(&fd, &filename, &argv, &envp, &flags, &retval);
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 out_free:
 	free_bprm(bprm);
