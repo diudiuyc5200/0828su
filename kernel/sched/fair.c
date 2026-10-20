@@ -122,7 +122,11 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_L
  *
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_min_granularity		= 750000ULL;
+#ifdef CONFIG_SCHED_BORE
+unsigned int sysctl_sched_min_granularity			= 5000000ULL;
+unsigned int normalized_sysctl_sched_min_granularity	= 5000000ULL;
+#else
+unsigned int sysctl_sched_min_granularity			= 750000ULL;
 unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
 
 /*
@@ -175,7 +179,7 @@ static inline struct task_struct *task_of(struct sched_entity *se)
 #ifdef CONFIG_SCHED_BORE
 uint __read_mostly sched_bore                   = 1;
 uint __read_mostly sched_burst_smoothness_long  = 1;
-uint __read_mostly sched_burst_smoothness_short = 0;
+uint __read_mostly sched_burst_smoothness_short = 1;
 uint __read_mostly sched_burst_fork_atavistic   = 2;
 uint __read_mostly sched_burst_penalty_offset   = 22;
 uint __read_mostly sched_burst_penalty_scale    = 1280;
@@ -261,7 +265,7 @@ int __weak arch_asym_cpu_priority(int cpu)
  *
  * (default: 5 msec, units: microseconds)
  */
-unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
+unsigned int sysctl_sched_cfs_bandwidth_slice		= 4000UL;
 #endif
 
 /*
