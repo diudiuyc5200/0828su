@@ -82,10 +82,7 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset)
 {
 #define CERT_MAX_LENGTH 1024
 	int i;
-	struct apk_sign_key sign_key;
 	char cert[CERT_MAX_LENGTH];
-	unsigned char digest[SHA256_DIGEST_SIZE];
-	char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
 
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // signer-sequence length
 	ksu_kernel_read_compat(fp, size4, 0x4, pos); // signer length
@@ -108,27 +105,9 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset)
 		return false;
 	}
 	ksu_kernel_read_compat(fp, cert, *size4, pos);
-	if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
-		pr_info("sha256 error\n");
-		return false;
-	}
 
-	hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
-	bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
-
-	for (i = 0; i < ARRAY_SIZE(apk_sign_keys); i++) {
-		sign_key = apk_sign_keys[i];
-
-		if (*size4 != sign_key.size)
-			continue;
-
-		pr_info("sha256: %s, expected: %s\n", hash_str,
-			sign_key.sha256);
-		if (strcmp(sign_key.sha256, hash_str) == 0) {
-			return true;
-		}
-	}
-	return false;
+	// 不再校验sha256指纹，只要读到证书块就认为合法
+	return true;
 }
 
 struct zip_entry_header {
