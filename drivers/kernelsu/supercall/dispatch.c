@@ -1,3 +1,37 @@
+#include <linux/capability.h>
+#include <linux/cred.h>
+#include <linux/kallsyms.h>
+#include <linux/mm.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
+#include <linux/thread_info.h>
+#include "uapi/supercall.h"
+#include "supercall/internal.h"
+#include "arch.h" // IWYU pragma: keep
+#include "policy/allowlist.h"
+#include "policy/feature.h"
+#include "klog.h" // IWYU pragma: keep
+#include "ksu.h"
+#include "runtime/ksud_boot.h"
+#include "feature/kernel_umount.h"
+#include "manager/manager_identity.h"
+#include "extension/dynamic_manager.h"
+#include "selinux/selinux.h"
+#include "infra/file_wrapper.h"
+#include "hook/tp_marker.h"
+#include "policy/app_profile.h"
+#include "sulog/event.h"
+#include "sulog/fd.h"
+#include "supercall/supercall.h"
+#include "infra/symbol_resolver.h"
+#include "preinit/preinit.h"
+#include "feature/uts_spoof.h"
+#include "extension/extension.h"
+#include "extension/umount_paths.h"
+
 static int do_grant_root(void __user *arg)
 {
     int ret;
@@ -17,10 +51,26 @@ static int do_get_info(void __user *arg)
 {
     struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
 
+#ifdef MODULE
+    cmd.flags |= KSU_GET_INFO_FLAG_LKM;
+    if (ksu_bundled) {
+        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;
+    }
+#endif
+
     if (is_manager()) {
         cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
     }
-
+    if (ksu_late_loaded) {
+        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;
+    }
+    // A late load never sees PID 1's selinux_setup, so preinit cannot run.
+    if (ksu_preinit_enabled_param() && !ksu_late_loaded) {
+        cmd.flags |= KSU_GET_INFO_FLAG_PREINIT;
+    }
+#if KSU_IS_PR_BUILD
+    cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
+#endif
     cmd.features = KSU_FEATURE_MAX;
     cmd.uapi_version = KERNEL_SU_UAPI_VERSION;
 
@@ -38,12 +88,18 @@ static int do_get_info_legacy(void __user *arg)
 
 #ifdef MODULE
     cmd.flags |= KSU_GET_INFO_FLAG_LKM;
+    if (ksu_bundled) {
+        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;
+    }
 #endif
 
     if (is_manager()) {
         cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;
     }
-#ifdef EXPECTED_SIZE2
+    if (ksu_late_loaded) {
+        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;
+    }
+#if KSU_IS_PR_BUILD
     cmd.flags |= KSU_GET_INFO_FLAG_PR_BUILD;
 #endif
     cmd.features = KSU_FEATURE_MAX;
@@ -58,6 +114,7 @@ static int do_get_info_legacy(void __user *arg)
 
 static int do_report_event(void __user *arg)
 {
+    static bool services_started = false;
     struct ksu_report_event_cmd cmd;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
@@ -67,10 +124,17 @@ static int do_report_event(void __user *arg)
     switch (cmd.event) {
     case EVENT_POST_FS_DATA: {
         static bool post_fs_data_lock = false;
+
+        // Reset for emulated soft reboot
+        services_started = false;
         if (!post_fs_data_lock) {
             post_fs_data_lock = true;
-            pr_info("post-fs-data triggered\n");
-            on_post_fs_data();
+            if (ksu_late_loaded) {
+                pr_info("post-fs-data skipped (late load)\n");
+            } else {
+                pr_info("post-fs-data triggered\n");
+                on_post_fs_data();
+            }
         }
         break;
     }
@@ -78,11 +142,12 @@ static int do_report_event(void __user *arg)
         static bool boot_complete_lock = false;
         if (!boot_complete_lock) {
             boot_complete_lock = true;
-            pr_info("boot_complete triggered\n");
-            on_boot_completed();
-#ifdef CONFIG_KSU_SUSFS
-            susfs_start_sdcard_monitor_fn();
-#endif
+            if (ksu_late_loaded) {
+                pr_info("boot_complete skipped (late load)\n");
+            } else {
+                pr_info("boot_complete triggered\n");
+                on_boot_completed();
+            }
         }
         break;
     }
@@ -90,6 +155,15 @@ static int do_report_event(void __user *arg)
         pr_info("module mounted!\n");
         on_module_mounted();
         break;
+    }
+    case EVENT_SERVICES: {
+        if (services_started) {
+            pr_info("services already started, skipping\n");
+            return 0;
+        }
+        services_started = true;
+        pr_info("services triggered\n");
+        return 1;
     }
     default:
         break;
@@ -130,7 +204,6 @@ static int do_check_safemode(void __user *arg)
 static int do_new_get_allow_list_common(void __user *arg, bool allow)
 {
     struct ksu_new_get_allow_list_cmd cmd;
-    bool success = false;
     int *arr = NULL;
     int err = 0;
 
@@ -145,7 +218,8 @@ static int do_new_get_allow_list_common(void __user *arg, bool allow)
         }
     }
 
-    success = ksu_get_allow_list(arr, cmd.count, &cmd.count, &cmd.total_count, allow);
+    bool success = ksu_get_allow_list(arr, cmd.count, &cmd.count, &cmd.total_count, allow);
+
     if (!success) {
         err = -EFAULT;
         goto out;
@@ -185,7 +259,6 @@ static int do_get_allow_list_common(void __user *arg, bool allow)
     int err = 0;
     u16 count;
     u32 out_count;
-    bool success = false;
     static const u16 kSize = 128;
 
     arr = kmalloc(sizeof(int) * kSize, GFP_KERNEL);
@@ -193,7 +266,8 @@ static int do_get_allow_list_common(void __user *arg, bool allow)
         return -ENOMEM;
     }
 
-    success = ksu_get_allow_list(arr, kSize, &count, NULL, allow);
+    bool success = ksu_get_allow_list(arr, kSize, &count, NULL, allow);
+
     if (!success) {
         err = -EFAULT;
         goto out;
@@ -237,7 +311,7 @@ static int do_uid_granted_root(void __user *arg)
         return -EFAULT;
     }
 
-    cmd.granted = ksu_is_allow_uid_for_current(cmd.uid);
+    cmd.granted = ksu_is_uid_granted_root(cmd.uid);
 
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         pr_err("uid_granted_root: copy_to_user failed\n");
@@ -281,6 +355,9 @@ static int do_get_manager_appid(void __user *arg)
 
 static int do_get_app_profile(void __user *arg)
 {
+#ifdef CONFIG_KSU_DISABLE_POLICY
+    return -EOPNOTSUPP;
+#endif
     uid_t uid;
     struct app_profile *profile;
     int ret = 0;
@@ -309,6 +386,10 @@ static int do_get_app_profile(void __user *arg)
 
 static int do_set_app_profile(void __user *arg)
 {
+#ifdef CONFIG_KSU_DISABLE_POLICY
+    return -EOPNOTSUPP;
+#endif
+
     struct ksu_set_app_profile_cmd cmd;
     int ret;
 
@@ -318,15 +399,17 @@ static int do_set_app_profile(void __user *arg)
     }
 
     ret = ksu_set_app_profile(&cmd.profile);
-    if (!ret)
+    if (!ret) {
         ksu_persistent_allow_list();
+        ksu_mark_running_process();
+    }
     return ret;
 }
 
 static int do_get_feature(void __user *arg)
 {
     struct ksu_get_feature_cmd cmd;
-    bool supported;
+    bool supported = false;
     int ret;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
@@ -335,7 +418,13 @@ static int do_get_feature(void __user *arg)
     }
 
     ret = ksu_get_feature(cmd.feature_id, &cmd.value, &supported);
-    cmd.supported = supported ? 1 : 0;
+    cmd.supported = 0;
+    if (supported) {
+        cmd.supported |= KSU_FEATURE_FLAG_SUPPORTED;
+        if (ksu_feature_is_forced(cmd.feature_id)) {
+            cmd.supported |= KSU_FEATURE_FLAG_FORCED;
+        }
+    }
 
     if (ret && supported) {
         pr_err("get_feature: failed for feature %u: %d\n", cmd.feature_id, ret);
@@ -386,335 +475,66 @@ static int do_get_wrapper_fd(void __user *arg)
 
 static int do_manage_mark(void __user *arg)
 {
-    return -ENOTSUPP;
-}
+    struct ksu_manage_mark_cmd cmd;
+    int ret = 0;
 
-#ifdef CONFIG_KSU_SUSFS
-int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
-		     unsigned long arg4, unsigned long arg5)
-{
-	if (option != (int)0xDEADBEEF) {
-		return -ENOSYS;
-	}
-
-	// SukiSU / KernelSU version fallback query: prctl(0xDEADBEEF, 2, &features, &flags_and_version, &uapi_version)
-	if (arg2 == 2) {
-		u32 features = KSU_FEATURE_MAX;
-		u32 flags_and_version = KERNEL_SU_VERSION;
-		u32 uapi_version = KERNEL_SU_UAPI_VERSION;
-
-		if (is_manager()) {
-			flags_and_version |= KSU_GET_INFO_FLAG_MANAGER;
-		}
-
-		if (arg3 && copy_to_user((void __user *)arg3, &features, sizeof(features)))
-			return -EFAULT;
-		if (arg4 && copy_to_user((void __user *)arg4, &flags_and_version, sizeof(flags_and_version)))
-			return -EFAULT;
-		if (arg5 && copy_to_user((void __user *)arg5, &uapi_version, sizeof(uapi_version)))
-			return -EFAULT;
-
-		return 0;
-	}
-
-	// Fallback to install KSU driver fd for manager or root
-	if (arg2 == KSU_INSTALL_MAGIC2) {
-		if (is_manager() || current_uid().val == 0) {
-			int fd = ksu_install_fd();
-			if (arg3 && copy_to_user((void __user *)arg3, &fd, sizeof(fd)))
-				return -EFAULT;
-			return 0;
-		}
-	}
-
-	if (current_uid().val == 0) {
-#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-		if (arg2 == CMD_SUSFS_ADD_SUS_PATH) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_sus_path))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_PATH -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_PATH -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_sus_path((struct st_susfs_sus_path __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_SUS_PATH -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-		if (arg2 == CMD_SUSFS_ADD_SUS_MOUNT) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_sus_mount))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_MOUNT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_MOUNT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_sus_mount((struct st_susfs_sus_mount __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_SUS_MOUNT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-		if (arg2 == CMD_SUSFS_ADD_SUS_KSTAT) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_sus_kstat))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_KSTAT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_KSTAT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_SUS_KSTAT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-		if (arg2 == CMD_SUSFS_UPDATE_SUS_KSTAT) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_sus_kstat))) {
-				pr_err("susfs: CMD_SUSFS_UPDATE_SUS_KSTAT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_UPDATE_SUS_KSTAT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_update_sus_kstat((struct st_susfs_sus_kstat __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_UPDATE_SUS_KSTAT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-		if (arg2 == CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_sus_kstat))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_sus_kstat((struct st_susfs_sus_kstat __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-		if (arg2 == CMD_SUSFS_ADD_TRY_UMOUNT) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_try_umount))) {
-				pr_err("susfs: CMD_SUSFS_ADD_TRY_UMOUNT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_TRY_UMOUNT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_try_umount((struct st_susfs_try_umount __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_TRY_UMOUNT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-		if (arg2 == CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS) {
-			susfs_try_umount(current_uid().val);
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-		if (arg2 == CMD_SUSFS_SET_UNAME) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_uname))) {
-				pr_err("susfs: CMD_SUSFS_SET_UNAME -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_SET_UNAME -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_set_uname((struct st_susfs_uname __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_SET_UNAME -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-		if (arg2 == CMD_SUSFS_ENABLE_LOG) {
-			int error = 0;
-			if (arg3 != 0 && arg3 != 1) {
-				pr_err("susfs: CMD_SUSFS_ENABLE_LOG -> arg3 can only be 0 or 1\n");
-				return 0;
-			}
-			susfs_set_log(arg3);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-		if (arg2 == CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, SUSFS_FAKE_CMDLINE_OR_BOOTCONFIG_SIZE)) {
-				pr_err("susfs: CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_set_cmdline_or_bootconfig((char __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-		if (arg2 == CMD_SUSFS_ADD_OPEN_REDIRECT) {
-			int error = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(struct st_susfs_open_redirect))) {
-				pr_err("susfs: CMD_SUSFS_ADD_OPEN_REDIRECT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_ADD_OPEN_REDIRECT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = susfs_add_open_redirect((struct st_susfs_open_redirect __user*)arg3);
-			pr_info("susfs: CMD_SUSFS_ADD_OPEN_REDIRECT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-#endif //#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-		if (arg2 == CMD_SUSFS_SHOW_VERSION) {
-			int error = 0;
-			int len_of_susfs_version = strlen(SUSFS_VERSION);
-			char *susfs_version = SUSFS_VERSION;
-			if (!ksu_access_ok((void __user*)arg3, len_of_susfs_version+1)) {
-				pr_err("susfs: CMD_SUSFS_SHOW_VERSION -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_SHOW_VERSION -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = copy_to_user((void __user*)arg3, (void*)susfs_version, len_of_susfs_version+1);
-			pr_info("susfs: CMD_SUSFS_SHOW_VERSION -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-		if (arg2 == CMD_SUSFS_SHOW_ENABLED_FEATURES) {
-			int error = 0;
-			u64 enabled_features = 0;
-			if (!ksu_access_ok((void __user*)arg3, sizeof(u64))) {
-				pr_err("susfs: CMD_SUSFS_SHOW_ENABLED_FEATURES -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_SHOW_ENABLED_FEATURES -> arg5 is not accessible\n");
-				return 0;
-			}
-#ifdef CONFIG_KSU_SUSFS_SUS_PATH
-			enabled_features |= (1 << 0);
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-			enabled_features |= (1 << 1);
-#endif
-#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-			enabled_features |= (1 << 2);
-#endif
-#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-			enabled_features |= (1 << 3);
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-			enabled_features |= (1 << 4);
-#endif
-#ifdef CONFIG_KSU_SUSFS_SUS_OVERLAYFS
-			enabled_features |= (1 << 5);
-#endif
-#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
-			enabled_features |= (1 << 6);
-#endif
-#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-			enabled_features |= (1 << 7);
-#endif
-#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-			enabled_features |= (1 << 8);
-#endif
-#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
-			enabled_features |= (1 << 9);
-#endif
-#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-			enabled_features |= (1 << 10);
-#endif
-#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-			enabled_features |= (1 << 11);
-#endif
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-			enabled_features |= (1 << 12);
-#endif
-#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
-			enabled_features |= (1 << 14);
-#endif
-			error = copy_to_user((void __user*)arg3, (void*)&enabled_features, sizeof(enabled_features));
-			pr_info("susfs: CMD_SUSFS_SHOW_ENABLED_FEATURES -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-		if (arg2 == CMD_SUSFS_SHOW_VARIANT) {
-			int error = 0;
-			int len_of_variant = strlen(SUSFS_VARIANT);
-			char *susfs_variant = SUSFS_VARIANT;
-			if (!ksu_access_ok((void __user*)arg3, len_of_variant+1)) {
-				pr_err("susfs: CMD_SUSFS_SHOW_VARIANT -> arg3 is not accessible\n");
-				return 0;
-			}
-			if (!ksu_access_ok((void __user*)arg5, sizeof(error))) {
-				pr_err("susfs: CMD_SUSFS_SHOW_VARIANT -> arg5 is not accessible\n");
-				return 0;
-			}
-			error = copy_to_user((void __user*)arg3, (void*)susfs_variant, len_of_variant+1);
-			pr_info("susfs: CMD_SUSFS_SHOW_VARIANT -> ret: %d\n", error);
-			if (copy_to_user((void __user*)arg5, &error, sizeof(error)))
-				pr_info("susfs: copy_to_user() failed\n");
-			return 0;
-		}
-	}
-
-	return -ENOSYS;
-}
-
-int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
-{
-    if (magic1 != KSU_INSTALL_MAGIC1) {
-        return -EINVAL; 
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
+        pr_err("manage_mark: copy_from_user failed\n");
+        return -EFAULT;
     }
 
-    if (magic2 == KSU_INSTALL_MAGIC2)
-        return ksu_supercall_reboot_handler(arg);
+    switch (cmd.operation) {
+    case KSU_MARK_GET: {
+        // Get task mark status
+        ret = ksu_get_task_mark(cmd.pid);
+        if (ret < 0) {
+            pr_err("manage_mark: get failed for pid %d: %d\n", cmd.pid, ret);
+            return ret;
+        }
+        cmd.result = (u32)ret;
+        break;
+    }
+    case KSU_MARK_MARK: {
+        if (cmd.pid == 0) {
+            ksu_mark_all_process();
+        } else {
+            ret = ksu_set_task_mark(cmd.pid, true);
+            if (ret < 0) {
+                pr_err("manage_mark: set_mark failed for pid %d: %d\n", cmd.pid, ret);
+                return ret;
+            }
+        }
+        break;
+    }
+    case KSU_MARK_UNMARK: {
+        if (cmd.pid == 0) {
+            ksu_unmark_all_process();
+        } else {
+            ret = ksu_set_task_mark(cmd.pid, false);
+            if (ret < 0) {
+                pr_err("manage_mark: set_unmark failed for pid %d: %d\n", cmd.pid, ret);
+                return ret;
+            }
+        }
+        break;
+    }
+    case KSU_MARK_REFRESH: {
+        ksu_mark_running_process();
+        pr_info("manage_mark: refreshed running processes\n");
+        break;
+    }
+    default: {
+        pr_err("manage_mark: invalid operation %u\n", cmd.operation);
+        return -EINVAL;
+    }
+    }
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        pr_err("manage_mark: copy_to_user failed\n");
+        return -EFAULT;
+    }
 
-    return -EINVAL;
+    return 0;
 }
-#endif
 
 static int do_nuke_ext4_sysfs(void __user *arg)
 {
@@ -730,7 +550,7 @@ static int do_nuke_ext4_sysfs(void __user *arg)
 
     memset(mnt, 0, sizeof(mnt));
 
-    ret = ksu_strncpy_from_user_nofault(mnt, cmd.arg, sizeof(mnt));
+    ret = strncpy_from_user(mnt, cmd.arg, sizeof(mnt));
     if (ret < 0) {
         pr_err("nuke ext4 copy mnt failed: %ld\n", ret);
         return -EFAULT;
@@ -746,110 +566,11 @@ static int do_nuke_ext4_sysfs(void __user *arg)
     return nuke_ext4_sysfs(mnt);
 }
 
-struct list_head mount_list = LIST_HEAD_INIT(mount_list);
-DECLARE_RWSEM(mount_list_lock);
-
-static int add_try_umount(void __user *arg)
-{
-    struct mount_entry *new_entry, *entry, *tmp;
-    struct ksu_add_try_umount_cmd cmd;
-    char buf[256] = { 0 };
-
-    if (copy_from_user(&cmd, arg, sizeof cmd))
-        return -EFAULT;
-
-    switch (cmd.mode) {
-    case KSU_UMOUNT_WIPE: {
-        struct mount_entry *entry, *tmp;
-        down_write(&mount_list_lock);
-        list_for_each_entry_safe (entry, tmp, &mount_list, list) {
-            pr_info("wipe_umount_list: removing entry: %s\n", entry->umountable);
-            list_del(&entry->list);
-            kfree(entry->umountable);
-            kfree(entry);
-        }
-        up_write(&mount_list_lock);
-
-        return 0;
-    }
-
-    case KSU_UMOUNT_ADD: {
-        long len = ksu_strncpy_from_user_nofault(buf, (const char __user *)cmd.arg, 256);
-        if (len <= 0)
-            return -EFAULT;
-
-        buf[sizeof(buf) - 1] = '\0';
-
-        new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-        if (!new_entry)
-            return -ENOMEM;
-
-        new_entry->umountable = kstrdup(buf, GFP_KERNEL);
-        if (!new_entry->umountable) {
-            kfree(new_entry);
-            return -ENOMEM;
-        }
-
-        down_write(&mount_list_lock);
-
-        // disallow dupes
-        // if this gets too many, we can consider moving this whole task to a kthread
-        list_for_each_entry (entry, &mount_list, list) {
-            if (!strcmp(entry->umountable, buf)) {
-                pr_info("cmd_add_try_umount: %s is already here!\n", buf);
-                up_write(&mount_list_lock);
-                kfree(new_entry->umountable);
-                kfree(new_entry);
-                return -EEXIST;
-            }
-        }
-
-        // now check flags and add
-        // this also serves as a null check
-        if (cmd.flags)
-            new_entry->flags = cmd.flags;
-        else
-            new_entry->flags = 0;
-
-        // debug
-        list_add(&new_entry->list, &mount_list);
-        up_write(&mount_list_lock);
-        pr_info("cmd_add_try_umount: %s added!\n", buf);
-
-        return 0;
-    }
-
-    // this is just strcmp'd wipe anyway
-    case KSU_UMOUNT_DEL: {
-        long len = ksu_strncpy_from_user_nofault(buf, (const char __user *)cmd.arg, sizeof(buf) - 1);
-        if (len <= 0)
-            return -EFAULT;
-
-        buf[sizeof(buf) - 1] = '\0';
-
-        down_write(&mount_list_lock);
-        list_for_each_entry_safe (entry, tmp, &mount_list, list) {
-            if (!strcmp(entry->umountable, buf)) {
-                pr_info("cmd_add_try_umount: entry removed: %s\n", entry->umountable);
-                list_del(&entry->list);
-                kfree(entry->umountable);
-                kfree(entry);
-            }
-        }
-        up_write(&mount_list_lock);
-
-        return 0;
-    }
-
-    default: {
-        pr_err("cmd_add_try_umount: invalid operation %u\n", cmd.mode);
-        return -EINVAL;
-    }
-
-    } // switch(cmd.mode)
-
-    return 0;
-}
+/*
+ * mount_list / mount_list_lock were relocated to kernel/extension/umount_paths.h
+ * (and are defined in kernel/extension/umount_paths.c). See that header for the
+ * canonical definitions.
+ */
 
 static int do_set_init_pgrp(void __user *arg)
 {
@@ -907,102 +628,101 @@ static int do_disable_escape_to_root(void __user *arg)
     return 0;
 }
 
-static int list_try_umount(void __user *arg)
+/*
+ * Resolve symbols of the running kernel image, exported or not, matching
+ * them like ksuinit's /proc/kallsyms walk. Userspace uses this to bind a
+ * module's undefined symbols before init_module, so the kernel never parses
+ * the module ELF itself.
+ */
+static int do_lookup_symbols(void __user *arg)
 {
-    struct ksu_list_try_umount_cmd cmd;
-    struct mount_entry *entry;
-    char *output_buf;
-    size_t output_size;
-    size_t offset = 0;
+    struct ksu_lookup_symbols_cmd cmd;
+    const u64 __user *unames;
+    u64 __user *uaddrs;
+    char **names;
+    unsigned long *addrs;
     int ret = 0;
-    bool using_vmalloc = false;
-    int mount_count = 0;
-    
-    #define MAX_UMOUNT_LIST_SIZE (2 * 1024 * 1024)  // 2MB absolute max
-    #define DEFAULT_UMOUNT_SIZE (64 * 1024)         // 64KB default
+    u32 i;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd)))
         return -EFAULT;
 
-    if (cmd.buf_size > 1024 * 1024) {
-        pr_err("list_try_umount: invalid buf_size %u\n", cmd.buf_size);
+    if (cmd.flags) {
+        pr_err("lookup_symbols: unsupported flags 0x%x\n", cmd.flags);
         return -EINVAL;
     }
-
-    output_size = cmd.buf_size ? cmd.buf_size : 4096;
-
-    if (!cmd.arg || output_size == 0)
+    if (!cmd.count || cmd.count > KSU_LOOKUP_SYMBOLS_MAX)
         return -EINVAL;
 
-    // Count mounts first to estimate size needed
-    down_read(&mount_list_lock);
-    list_for_each_entry(entry, &mount_list, list) {
-        mount_count++;
-    }
-    up_read(&mount_list_lock);
-
-    // Calculate needed size: ~200 bytes per mount + 1KB header
-    output_size = 1024 + (mount_count * 200);
-    
-    // Use at least default size, cap at maximum
-    if (output_size < DEFAULT_UMOUNT_SIZE)
-        output_size = DEFAULT_UMOUNT_SIZE;
-    if (output_size > MAX_UMOUNT_LIST_SIZE)
-        output_size = MAX_UMOUNT_LIST_SIZE;
-
-    pr_info("KernelSU: Allocating %zu bytes for %d mounts (user requested %zu)\n",
-            output_size, mount_count, (size_t)cmd.buf_size);
-
-    // Try kzalloc first with NOWARN flag
-    output_buf = kzalloc(output_size, GFP_KERNEL | __GFP_NOWARN);
-    if (!output_buf) {
-        // Fallback to vzalloc for large allocations
-        pr_info("KernelSU: kzalloc failed for %zu bytes, using vzalloc\n", 
-                output_size);
-        output_buf = vzalloc(output_size);
-        using_vmalloc = true;
+    names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);
+    addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);
+    if (!names || !addrs) {
+        ret = -ENOMEM;
+        goto out;
     }
 
-    if (!output_buf) {
-        pr_err("KernelSU: Failed to allocate %zu bytes for umount list\n",
-               output_size);
-        return -ENOMEM;
-    }
-    offset += snprintf(output_buf + offset, output_size - offset,
-               "Mount Point\tFlags\n");
-    offset += snprintf(output_buf + offset, output_size - offset,
-               "----------\t-----\n");
+    unames = (const u64 __user *)(uintptr_t)cmd.names;
+    uaddrs = (u64 __user *)(uintptr_t)cmd.addrs;
+    for (i = 0; i < cmd.count; i++) {
+        u64 uname;
+        char *name;
 
-    down_read(&mount_list_lock);
-    list_for_each_entry (entry, &mount_list, list) {
-        int written =
-            snprintf(output_buf + offset, output_size - offset,
-                 "%s\t%u\n", entry->umountable, entry->flags);
-        if (written < 0) {
+        if (get_user(uname, unames + i)) {
             ret = -EFAULT;
-            break;
+            goto out;
         }
-        if (written >= (int)(output_size - offset)) {
-            // Should rarely happen since we calculated size
-            pr_warn("KernelSU: Buffer full, truncating mount list\n");
-            ret = -ENOSPC;
-            break;
+        name = strndup_user((const char __user *)(uintptr_t)uname, KSYM_NAME_LEN);
+        if (IS_ERR(name)) {
+            // An overlong name cannot be a kernel symbol: report it missing.
+            if (PTR_ERR(name) == -EINVAL)
+                continue;
+            ret = PTR_ERR(name);
+            goto out;
         }
-        offset += written;
+        if (!*name) {
+            kfree(name);
+            continue;
+        }
+        names[i] = name;
     }
-    up_read(&mount_list_lock);
 
-    if (ret == 0) {
-        if (copy_to_user((void __user *)cmd.arg, output_buf, offset))
+    ret = ksu_lookup_kernel_symbols((const char *const *)names, addrs, cmd.count);
+    if (ret < 0)
+        goto out;
+
+    for (i = 0; i < cmd.count; i++) {
+        if (put_user((u64)addrs[i], uaddrs + i)) {
             ret = -EFAULT;
+            goto out;
+        }
     }
 
-    // Free using the correct method
-    if (using_vmalloc)
-        vfree(output_buf);
-    else
-        kfree(output_buf);
+out:
+    if (names) {
+        for (i = 0; i < cmd.count; i++)
+            kfree(names[i]);
+    }
+    kvfree(names);
+    kvfree(addrs);
     return ret;
+}
+
+// do_set_spoof_cpu was relocated to kernel/extension/cpu_spoof.c.
+// do_set_spoof_version stays here because the KSU_IOCTL_SET_SPOOF_VERSION
+// number is kept (see uapi/supercall.h).
+
+static int do_set_spoof_version(void __user *arg)
+{
+    struct ksu_set_spoof_version_cmd cmd;
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    cmd.release[sizeof(cmd.release) - 1] = '\0';
+    cmd.version[sizeof(cmd.version) - 1] = '\0';
+
+    return ksu_set_spoof_version(cmd.release[0] != '\0' ? cmd.release : NULL,
+                                 cmd.version[0] != '\0' ? cmd.version : NULL);
 }
 
 // 100. GET_FULL_VERSION - Get full version string
@@ -1024,11 +744,7 @@ static int do_get_full_version(void __user *arg)
 static int do_get_hook_type(void __user *arg)
 {
     struct ksu_hook_type_cmd cmd = { 0 };
-#ifdef CONFIG_KSU_SUSFS
-    const char *type = "SUSFS Inline Hook";
-#else
-    const char *type = "Manual Hook";
-#endif
+    const char *type = "Tracepoint Syscall Redirect";
 
     strscpy(cmd.hook_type, type, sizeof(cmd.hook_type));
 
@@ -1040,19 +756,89 @@ static int do_get_hook_type(void __user *arg)
     return 0;
 }
 
-// 102. ENABLE_KPM - Check if KPM is enabled
-static int do_enable_kpm(void __user *arg)
+/*
+ * Single entry point for the four extensions. Userspace fills
+ * struct ksu_extension_cmd with an extension_id and one of:
+ *   GET  -> returns supported/value. value=0 and supported=true
+ *           for io-only handlers (handler presence is the signal).
+ *   SET  -> value-flavoured: forwards to ops->set.
+ *           io-flavoured:    -EOPNOTSUPP (no sticky bit).
+ *           While a force_extension=<id> is in effect, all SETs
+ *           return -EPERM until reboot. On success, the post-set
+ *           state (supported / forced flag / current value) is
+ *           written back to *arg so userspace can confirm the write
+ *           without an extra GET round-trip.
+ *   IO   -> forwards cmd.user_ptr to the registered io_handler.
+ *   WIPE -> handler->wipe (kernel-side). Today only umount_paths
+ *           registers one; other handlers return -EOPNOTSUPP. Wipe
+ *           does not go through io_handler.
+ */
+static int do_extension(void __user *arg)
 {
-    struct ksu_enable_kpm_cmd cmd;
+    struct ksu_extension_cmd cmd;
+    u32 extension_id;
+    int ret;
 
-    cmd.enabled = IS_ENABLED(CONFIG_KPM);
-
-    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
-        pr_err("enable_kpm: copy_to_user failed\n");
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
         return -EFAULT;
+
+    extension_id = cmd.id;
+    if (extension_id >= KSU_EXTENSION_MAX)
+        return -EINVAL;
+
+    /* op == IO  -> forward the user pointer verbatim */
+    if (cmd.op == KSU_EXTENSION_IO)
+        return ksu_extension_ioctl(extension_id,
+                                   (void __user *)(uintptr_t)cmd.user_ptr);
+
+    /* op == WIPE -> call the extension's wipe handler if any */
+    if (cmd.op == KSU_EXTENSION_WIPE)
+        return ksu_extension_wipe(extension_id);
+
+    if (cmd.op == KSU_EXTENSION_SET) {
+        ret = ksu_extension_set(extension_id, cmd.value);
+        if (ret)
+            return ret;
+        /*
+         * Round-trip the post-set state to userspace. The cmd.supported
+         * field is documented as out, and a manager that just wrote
+         * `value=1` wants to see "supported, FORCED if applicable"
+         * come back rather than zeroed bytes. Failure to copy_to_user
+         * is non-fatal here (the write itself succeeded) but reported
+         * as -EFAULT so the caller can retry.
+         */
+        {
+            u64 value = 0;
+            bool supported = false;
+
+            (void)ksu_extension_get(extension_id, &value, &supported);
+            cmd.supported = supported ? KSU_FEATURE_FLAG_SUPPORTED : 0;
+            if (ksu_extension_is_forced(extension_id))
+                cmd.supported |= KSU_EXTENSION_FLAG_FORCED;
+            cmd.value = value;
+            if (copy_to_user(arg, &cmd, sizeof(cmd)))
+                return -EFAULT;
+        }
+        return 0;
     }
 
-    return 0;
+    {
+        u64 value = 0;
+        bool supported = false;
+
+        ret = ksu_extension_get(extension_id, &value, &supported);
+        if (ret)
+            return ret;
+        if (!supported)
+            return -EOPNOTSUPP;
+        cmd.value = value;
+        cmd.supported = KSU_FEATURE_FLAG_SUPPORTED;
+        if (ksu_extension_is_forced(extension_id))
+            cmd.supported |= KSU_EXTENSION_FLAG_FORCED;
+        if (copy_to_user(arg, &cmd, sizeof(cmd)))
+            return -EFAULT;
+        return 0;
+    }
 }
 
 // IOCTL handlers mapping table
@@ -1164,7 +950,8 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_GET_WRAPPER_FD,
         .name = "GET_WRAPPER_FD",
         .handler = do_get_wrapper_fd,
-        .perm_check = manager_or_root
+        .perm_check = manager_or_root,
+        .allow_su_session = true
     },
     {
         .cmd = KSU_IOCTL_MANAGE_MARK,
@@ -1196,42 +983,41 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .handler = do_get_sulog_fd,
         .perm_check = only_root
     },
-    { 
-        .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, 
-        .name = "DISABLE_ESCAPE_TO_ROOT", 
-        .handler = do_disable_escape_to_root, 
-        .perm_check = only_root 
+    {
+        .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT,
+        .name = "DISABLE_ESCAPE_TO_ROOT",
+        .handler = do_disable_escape_to_root,
+        .perm_check = only_root,
+        .allow_su_session = true
+    },
+    {
+        .cmd = KSU_IOCTL_LOOKUP_SYMBOLS,
+        .name = "LOOKUP_SYMBOLS",
+        .handler = do_lookup_symbols,
+        .perm_check = only_root
+    },
+    {
+        .cmd = KSU_IOCTL_SET_SPOOF_VERSION,
+        .name = "SET_SPOOF_VERSION",
+        .handler = do_set_spoof_version,
+        .perm_check = only_root
     },
     {
         .cmd = KSU_IOCTL_GET_FULL_VERSION,
         .name = "GET_FULL_VERSION",
         .handler = do_get_full_version,
-        .perm_check = manager_or_root
+        .perm_check = always_allow
     },
-    { 
+    {
         .cmd = KSU_IOCTL_HOOK_TYPE,
         .name = "GET_HOOK_TYPE",
         .handler = do_get_hook_type,
         .perm_check = manager_or_root
     },
-    { 
-        .cmd = KSU_IOCTL_ENABLE_KPM,
-        .name = "GET_ENABLE_KPM",
-        .handler = do_enable_kpm,
-        .perm_check = manager_or_root
-    },
-#ifdef CONFIG_KPM
-    { 
-        .cmd = KSU_IOCTL_KPM,
-        .name = "KPM_OPERATION",
-        .handler = do_kpm,
-        .perm_check = manager_or_root
-    },
-#endif
-    { 
-        .cmd = KSU_IOCTL_LIST_TRY_UMOUNT,
-        .name = "LIST_TRY_UMOUNT",
-        .handler = list_try_umount,
+    {
+        .cmd = KSU_IOCTL_EXTENSION,
+        .name = "EXTENSION",
+        .handler = do_extension,
         .perm_check = manager_or_root
     },
     {
@@ -1243,7 +1029,7 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 };
 // clang-format on
 
-long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
+long ksu_supercall_handle_ioctl(const struct file *filp, unsigned int cmd, void __user *argp)
 {
     int i;
 
@@ -1254,7 +1040,8 @@ long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
     for (i = 0; ksu_ioctl_handlers[i].handler; i++) {
         if (cmd == ksu_ioctl_handlers[i].cmd) {
             // Check permission first
-            if (ksu_ioctl_handlers[i].perm_check && !ksu_ioctl_handlers[i].perm_check()) {
+            if (ksu_ioctl_handlers[i].perm_check && !ksu_ioctl_handlers[i].perm_check() &&
+                !(ksu_ioctl_handlers[i].allow_su_session && ksu_is_su_session_fd(filp))) {
                 pr_warn("ksu ioctl: permission denied for cmd=0x%x uid=%d\n", cmd, current_uid().val);
                 return -EPERM;
             }
@@ -1279,4 +1066,9 @@ void __init ksu_supercall_dump_commands(void)
 
 void ksu_supercall_cleanup_state(void)
 {
+    /*
+     * mount_list / mount_list_lock are owned by kernel/extension/umount_paths.c.
+     * The umount_paths extension is responsible for wiping its own state; see
+     * ksu_extension_exit() and the WIPE branch of ksu_extension_umount_paths_io.
+     */
 }
