@@ -184,7 +184,6 @@ EXPORT_SYMBOL(vfs_statx_fd);
  * 0 will be returned on success, and a -ve error code if unsuccessful.
  */
  
- EXPORT_SYMBOL(vfs_statx_fd);
 #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
 #endif
