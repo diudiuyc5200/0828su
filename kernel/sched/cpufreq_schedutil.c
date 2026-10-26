@@ -468,13 +468,8 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 		 * recently, as the reduction is likely to be premature then.
 		 */
 		 
-		 if (policy->cpu == 4 && util > 15) {
-	unsigned int target = policy->max * 75 / 100;
-	if (next_f < target)
-		next_f = target;
-}
-if (policy->cpu == 7 && util > 10) {
-	unsigned int target = policy->max * 75 / 100;
+if (policy->cpu == 7 && util > 50) {
+	unsigned int target = policy->max * 65 / 100;
 	if (next_f < target)
 		next_f = target;
 }
@@ -538,7 +533,16 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		sugov_walt_adjust(j_sg_cpu, &util, &max);
 	}
 
-	return get_next_freq(sg_policy, util, max);
+	unsigned int next_f = get_next_freq(sg_policy, util, max);
+
+	/* ========= 新增：中核cluster强制保底高频 ========= */
+	if (policy->cpu == 4 && util > 150) {
+		unsigned int target = policy->max * 75 / 100;
+		if (next_f < target)
+			next_f = target;
+	}
+
+	return next_f;
 }
 
 static void sugov_update_shared(struct update_util_data *hook, u64 time,
