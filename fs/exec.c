@@ -832,6 +832,11 @@ EXPORT_SYMBOL(transfer_args_to_stack);
 
 #endif /* CONFIG_MMU */
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+#include <linux/susfs_def.h>
+extern struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode);
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+
 static struct file *do_open_execat(int fd, struct filename *name, int flags)
 {
 	struct file *file;
@@ -843,6 +848,11 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 		.lookup_flags = LOOKUP_FOLLOW,
 	};
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	struct filename *fake_filename = NULL;
+	bool is_inode_open_redirect = false;
+#endif
+
 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0)
 		return ERR_PTR(-EINVAL);
 	if (flags & AT_SYMLINK_NOFOLLOW)
@@ -850,7 +860,27 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 	if (flags & AT_EMPTY_PATH)
 		open_exec_flags.lookup_flags |= LOOKUP_EMPTY;
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+retry:
+#endif
+
 	file = do_filp_open(fd, name, &open_exec_flags);
+	#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (!is_inode_open_redirect && file && !IS_ERR(file)) {
+		struct inode *inode = file_inode(file);
+		if (SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(inode)) {
+			fake_filename = susfs_open_redirect_spoof_do_sys_openat(inode);
+			if (fake_filename && !IS_ERR(fake_filename)) {
+				is_inode_open_redirect = true;
+				fput(file);
+				if (tmp_name != name)
+					putname(tmp_name);
+				tmp_name = fake_filename;
+				goto retry;
+			}
+		}
+	}
+#endif
 	if (IS_ERR(file))
 		goto out;
 
@@ -869,10 +899,18 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 		fsnotify_open(file);
 
 out:
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (tmp_name != name)
+		putname(tmp_name);
+#endif
 	return file;
 
 exit:
 	fput(file);
+	#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (tmp_name != name)
+		putname(tmp_name);
+#endif
 	return ERR_PTR(err);
 }
 
